@@ -1,7 +1,7 @@
 {
   "name": "js-channel",
   "version": "1.0.0",
-  "description": "jschannel by mozilla published on npm & bower",
+  "description": "jschannel with react native support",
   "main": "src/jschannel.js",
   "scripts": {
     "build": ":",
@@ -14,7 +14,7 @@
     "url": "https://github.com/wix/jschannel.git"
   },
   "keywords": [],
-  "author": "Ofir Dagan <ofird@wix.com>",
+  "author": "Wealthica <hello@wealthica.com>",
   "license": "MIT",
   "devDependencies": {
     "bower-auto-release": "*",

@@ -1,5 +1,5 @@
 {
-  "name": "js-channel",
+  "name": "@wealthica/js-channel",
   "version": "1.0.0",
   "description": "jschannel with react native support",
   "main": "src/jschannel.js",

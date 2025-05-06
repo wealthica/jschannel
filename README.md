@@ -4,6 +4,9 @@ JSChannel is a small JavaScript abstraction layer on top of HTML5
 cross document messaging.  It builds rich messaging
 semantics out of postMessage.
 
+## Forked from
+Forked from https://github.com/wix-playground/jschannel/
+
 ## Overview
 
 HTML5's cross document messaging opens up a ton of possibilities for

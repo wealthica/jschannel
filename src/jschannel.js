@@ -95,12 +95,15 @@
 
     // global message handler
     var s_onMessage = function (e) {
+        console.log("--->s_onMessage", e);
         try {
             var m = JSON.parse(e.data);
             if (typeof m !== 'object' || m === null) throw "malformed";
+            console.log("--->s_onMessage111");
         } catch (err) {
+            console.log("--->s_onMessage222");
             // Ignore non-JSON messages
-            // console.debug("jschannel: received non-JSON message: ", e.data);
+            console.debug("jschannel: received non-JSON message: ", e.data);
             return;
         }
 
@@ -114,7 +117,7 @@
             o = e.origin;
             w = e.source;
         }
-
+        console.log("--->ReactNativeWebView", window.ReactNativeWebView);
         // Extract scope and method
         if (typeof m.method === 'string') {
             var ar = m.method.split('::');
@@ -127,6 +130,8 @@
                 meth = m.method;
             }
         }
+        console.log("--->method", meth);
+        console.log("--->scope", s);
 
         if (typeof m.id !== 'undefined') i = m.id;
 
@@ -520,6 +525,7 @@
 
             // Ready state handler
             var onReady = function (trans, type) {
+                alert("onReady");
                 debug('Received __ready message type: ' + type);
                 if (ready) {
                     debug("Warning: received ready message while already in ready state.");

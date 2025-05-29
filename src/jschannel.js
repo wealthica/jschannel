@@ -95,15 +95,12 @@
 
     // global message handler
     var s_onMessage = function (e) {
-        console.log("--->s_onMessage", e);
+        var m;
         try {
-            var m = JSON.parse(e.data);
+            m = JSON.parse(e.data);
             if (typeof m !== 'object' || m === null) throw "malformed";
-            console.log("--->s_onMessage111");
         } catch (err) {
-            console.log("--->s_onMessage222");
             // Ignore non-JSON messages
-            console.debug("jschannel: received non-JSON message: ", e.data);
             return;
         }
 
@@ -117,22 +114,12 @@
             o = e.origin;
             w = e.source;
         }
-        console.log("--->ReactNativeWebView", window.ReactNativeWebView);
         // Extract scope and method
         if (typeof m.method === 'string') {
             var ar = m.method.split('::');
-            if (ar.length == 2) {
-                s = ar[0];
-                meth = ar[1];
-            } else {
-                // If no scope prefix is found, assume default scope (empty string)
-                s = '';
-                meth = m.method;
-            }
+            if (ar.length == 2) { s = ar[0]; meth = ar[1]; }
+            else { s = ''; meth = m.method; }
         }
-        console.log("--->method", meth);
-        console.log("--->scope", s);
-
         if (typeof m.id !== 'undefined') i = m.id;
 
         // Route message based on properties
@@ -184,10 +171,16 @@
     // Channel builder
     return {
         build: function (cfg) {
+            var chanId = (function () {
+                var text = "";
+                var alpha = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+                for (var i = 0; i < 5; i++) text += alpha.charAt(Math.floor(Math.random() * alpha.length));
+                return text;
+            })();
+
             var debug = function (m) {
                 if (cfg.debugOutput && window.console && window.console.log) {
                     try { if (typeof m !== 'string') m = JSON.stringify(m); } catch (e) { /* ignore */ }
-                    console.log("[" + chanId + "] " + m);
                 }
             };
 
@@ -220,28 +213,8 @@
                 }
                 if (window === cfg.window) throw ("Target window is same as present window -- not allowed");
                 // Require explicit origin in standard env
-                if (typeof cfg.origin !== 'string') throw ("Channel.build() requires an origin argument");
+                if (typeof cfg.origin !== 'string') throw ("Channel.build() requires an origin argument"); 
             }
-
-
-            // Validate origin
-            var validOrigin = false;
-            if (typeof cfg.origin === 'string') {
-                if (cfg.origin === "*") {
-                    validOrigin = true;
-                } else if (isReactNativeWebView && cfg.origin === 'react-native-webview') {
-                    console.warn("jschannel: 'react-native-webview' origin is deprecated, prefer '*'.");
-                    validOrigin = true; // Allow for backward compatibility but warn
-                } else {
-                    var oMatch = cfg.origin.match(/^https?:\/\/(?:[-a-zA-Z0-9_\.])+(?::\d+)?/);
-                    if (oMatch !== null) {
-                        cfg.origin = oMatch[0].toLowerCase();
-                        validOrigin = true;
-                    }
-                }
-            }
-
-            if (!validOrigin) throw ("Channel.build() called with an invalid origin: " + cfg.origin);
 
             // Validate scope
             var scope = ''; // Default scope is empty string
@@ -250,20 +223,10 @@
                 if (cfg.scope.split('::').length > 1) throw "scope may not contain double colons: '::'";
                 scope = cfg.scope; // Use provided scope
             }
+            debug("Final scope for this instance: '" + scope + "'");
 
-            /* Private variables */
-            var chanId = (function () {
-                var text = "";
-                var alpha = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-                for (var i = 0; i < 5; i++) text += alpha.charAt(Math.floor(Math.random() * alpha.length));
-                return text;
-            })();
-
-            var regTbl = {};      // Method registry
-            var outTbl = {};      // Outbound transactions
-            var inTbl = {};       // Inbound transactions
-            var ready = false;     // Channel ready state
-            var pendingQueue = [];// Queue for messages before ready
+            var regTbl = {}; var outTbl = {}; var inTbl = {};
+            var ready = false; var pendingQueue = [];
 
             // Transaction creation logic
             var createTransaction = function (id, origin, callbacks) {
@@ -275,39 +238,29 @@
                     origin: origin,
                     invoke: function (cbName, v) {
                         if (completed) { localDebug("Warning: invoke called after completion"); return; }
-                        if (!inTbl[id]) { localDebug("Warning: invoke called for nonexistent transaction"); return; } // Changed from throw to warn
-
+                        if (!inTbl[id]) { localDebug("Warning: invoke called for nonexistent transaction"); return; }
                         var valid = false;
                         for (var i = 0; i < callbacks.length; i++) if (cbName === callbacks[i]) { valid = true; break; }
                         if (!valid) throw "Request supports no such callback '" + cbName + "'";
-
-                        localDebug("sending callback '" + cbName + "'");
-                        postMessage({ id: id, callback: cbName, params: v }, isReactNativeWebView); // Force post in RN
+                        postMessage({ id: id, callback: cbName, params: v }, isReactNativeWebView);
                     },
                     error: function (error, message) {
                         if (completed) { localDebug("Warning: error called after completion"); return; }
                         completed = true;
-                        if (!inTbl[id]) { localDebug("Warning: error called for nonexistent transaction"); return; } // Changed from throw to warn
-
+                        if (!inTbl[id]) { localDebug("Warning: error called for nonexistent transaction"); return; }
                         delete inTbl[id];
-                        // Don't delete from s_transIds here, that's for outbound calls
-                        localDebug("sending error: " + error + " / " + message);
-                        postMessage({ id: id, error: error, message: message }, isReactNativeWebView); // Force post in RN
+                        postMessage({ id: id, error: error, message: message }, isReactNativeWebView);
                     },
                     complete: function (v) {
                         if (completed) { localDebug("Warning: complete called after completion"); return; }
                         completed = true;
-                        if (!inTbl[id]) { localDebug("Warning: complete called for nonexistent transaction"); return; } // Changed from throw to warn
-
+                        if (!inTbl[id]) { localDebug("Warning: complete called for nonexistent transaction"); return; }
                         delete inTbl[id];
                         // Don't delete from s_transIds here
-                        localDebug("sending complete");
                         postMessage({ id: id, result: v }, isReactNativeWebView); // Force post in RN
                     },
                     delayReturn: function (delay) {
-                        if (typeof delay === 'boolean') {
-                            shouldDelayReturn = (delay === true);
-                        }
+                        if (typeof delay === 'boolean') { shouldDelayReturn = (delay === true); }
                         return shouldDelayReturn;
                     },
                     completed: function () {
@@ -339,164 +292,99 @@
             };
 
             // Internal message handler for routing based on cfg
-            var onMessage = function (origin, method, m) {
-                // Observer hook
-                if (typeof cfg.gotMessageObserver === 'function') {
-                    try {
-                        // Provide a clone to prevent observer mutation affecting logic
-                        cfg.gotMessageObserver(origin, JSON.parse(JSON.stringify(m)));
-                    } catch (e) {
-                        debug("gotMessageObserver() raised an exception: " + e.toString());
-                    }
-                }
+            var onMessage = function (origin, methodFromHandler, message) {
+                if (typeof cfg.gotMessageObserver === 'function') { /* ... */ }
+                var currentMethodName = methodFromHandler;
 
-                // Message routing logic
-                if (m.id && method) {
-                    // Request
-                    debug("received request: " + method + "() from " + origin + " (id: " + m.id + ")");
-                    if (regTbl[method]) {
-                        var trans = createTransaction(m.id, origin, m.callbacks ? m.callbacks : []);
-                        inTbl[m.id] = { callbacks: m.callbacks }; // Store info about the inbound transaction
+                if (message.id && currentMethodName) { // Request
+                    if (regTbl[currentMethodName]) {
+                        var trans = createTransaction(message.id, origin, message.callbacks ? message.callbacks : []);
+                        inTbl[message.id] = { callbacks: message.callbacks };
                         try {
-                            // Setup callbacks in params object if needed
-                            if (m.callbacks && s_isArray(m.callbacks) && m.callbacks.length > 0) {
-                                for (var i = 0; i < m.callbacks.length; i++) {
-                                    var path = m.callbacks[i];
-                                    var obj = m.params || {}; // Ensure params exists
-                                    var pathItems = path.split('/');
-                                    var currentObj = obj;
-                                    for (var j = 0; j < pathItems.length - 1; j++) {
-                                        var cp = pathItems[j];
-                                        if (typeof currentObj[cp] !== 'object' || currentObj[cp] === null) currentObj[cp] = {};
-                                        currentObj = currentObj[cp];
-                                    }
-                                    // Assign the function to the final path item
-                                    currentObj[pathItems[pathItems.length - 1]] = (function (cbName) {
-                                        return function (params) {
-                                            // Use the captured cbName
-                                            return trans.invoke(cbName, params);
-                                        };
-                                    })(path); // Immediately invoke to capture 'path'
-                                }
-                            }
-
-                            var resp = regTbl[method](trans, m.params);
+                            var resp = regTbl[currentMethodName](trans, message.params); // This calls the user's bound function
+                            // If the bound function (e.g. messageFromRN) calls trans.complete(),
+                            // then trans.completed() will be true here.
                             if (!trans.delayReturn() && !trans.completed()) {
                                 trans.complete(resp);
-                            }
-                        } catch (e) {
-                            debug("Exception executing bound method '" + method + "': " + e.toString());
-                            var error = "runtime_error";
-                            var message = e.toString();
-                            if (typeof e === 'string') {
-                                message = e;
-                            } else if (typeof e === 'object' && e !== null) {
-                                if (s_isArray(e) && e.length == 2 && typeof e[0] === 'string') {
-                                    error = e[0];
-                                    message = e[1];
-                                } else if (typeof e.error === 'string') {
-                                    error = e.error;
-                                    message = (typeof e.message === 'string') ? e.message : JSON.stringify(e.message);
-                                } else {
-                                    try { message = JSON.stringify(e); } catch (e2) { /* use toString */ }
-                                }
-                            }
-                            // Ensure transaction wasn't already completed by the exception handler
-                            if (!trans.completed()) {
-                                trans.error(error, message);
-                            }
-                        }
-                    } else {
-                        debug("No handler registered for method: " + method);
-                        // Optionally send a method_not_found error back
-                        // createTransaction(m.id, origin, []).error("method_not_found", "Method '" + method + "' is not bound.");
-                    }
-                } else if (m.id && m.callback) {
-                    // Callback invocation
-                    debug("received callback: " + m.callback + " for transaction " + m.id);
-                    if (outTbl[m.id] && outTbl[m.id].callbacks && outTbl[m.id].callbacks[m.callback]) {
-                        try {
-                            outTbl[m.id].callbacks[m.callback](m.params);
-                        } catch (e) {
-                            debug("Exception executing callback function for '" + m.callback + "': " + e);
-                            // Maybe call the main error handler? Depends on desired behavior.
-                            // if (typeof outTbl[m.id].error === 'function') {
-                            //     outTbl[m.id].error("callback_execution_error", "Exception in callback '" + m.callback + "': " + e.toString());
-                            //     delete outTbl[m.id];
-                            //     delete s_transIds[m.id];
-                            // }
-                        }
-                    } else {
-                        debug("ignoring invalid callback invocation, id: " + m.id + ", callback: " + m.callback);
-                    }
-                } else if (m.id) {
-                    // Response or Error
-                    debug("received response/error for transaction " + m.id);
-                    if (outTbl[m.id]) {
-                        // Clear any timeout associated with this transaction
-                        if (outTbl[m.id].timeoutId) {
-                            window.clearTimeout(outTbl[m.id].timeoutId);
-                        }
-                        try {
-                            if (m.error) {
-                                if (typeof outTbl[m.id].error === 'function') {
-                                    outTbl[m.id].error(m.error, m.message);
-                                } else {
-                                    debug("No error handler for transaction " + m.id + ", error: " + m.error);
-                                }
                             } else {
-                                if (typeof outTbl[m.id].success === 'function') {
-                                    // Provide result or undefined if not present
-                                    outTbl[m.id].success(m.result);
+                                debug("Bound method '" + currentMethodName + "' already completed or delayed return. Trans state: " + trans.completed());
+                            }
+                        } catch (e) {
+                            // This is where the "ReferenceError: Can't find variable: completed" was caught
+                            if (trans && !trans.completed()) { // Ensure trans exists and not already completed
+                                trans.error("runtime_error", e.toString());
+                            }
+                        }
+                    } else {
+                        debug("No handler in regTbl for request method: " + currentMethodName + " (original: " + message.method + ")");
+                    }
+                } else if (message.id && message.callback) {
+                    debug("received callback: " + message.callback + " for transaction " + message.id);
+                    if (outTbl[message.id] && outTbl[message.id].callbacks && outTbl[message.id].callbacks[message.callback]) {
+                        try {
+                            outTbl[message.id].callbacks[message.callback](message.params);
+                        } catch (e) {
+                            debug("Exception executing callback function for '" + message.callback + "': " + e);
+                        }
+                    } else {
+                        debug("ignoring invalid callback invocation, id: " + message.id + ", callback: " + message.callback);
+                    }
+                }
+                else if (message.id) {
+                    debug("received response/error for transaction " + message.id); // Use 'message.id'
+                    if (outTbl[message.id]) { // Use 'message.id'
+                        // Clear any timeout
+                        if (outTbl[message.id].timeoutId) {
+                            window.clearTimeout(outTbl[message.id].timeoutId);
+                        }
+                        try {
+                            if (message.error) { // Use 'message.error'
+                                if (typeof outTbl[message.id].error === 'function') {
+                                    outTbl[message.id].error(message.error, message.message); // Use 'message.error' and 'message.message'
                                 } else {
-                                    debug("No success handler for transaction " + m.id);
+                                    debug("No error handler for transaction " + message.id + ", error: " + message.error);
+                                }
+                            } else { // Success
+                                if (typeof outTbl[message.id].success === 'function') {
+                                    outTbl[message.id].success(message.result); // Use 'message.result'
+                                } else {
+                                    debug("No success handler for transaction " + message.id);
                                 }
                             }
                         } catch (e) {
-                            debug("Exception executing success/error handler for transaction " + m.id + ": " + e);
+                            debug("Exception executing success/error handler for transaction " + message.id + ": " + e);
                         } finally {
-                            // Clean up state regardless of handler success/failure
-                            delete outTbl[m.id];
-                            delete s_transIds[m.id];
+                            delete outTbl[message.id];
+                            delete s_transIds[message.id]; // s_transIds keys are numbers (transaction IDs), message.id is correct here.
                         }
                     } else {
-                        debug("ignoring response for unknown/completed transaction: " + m.id);
+                        debug("ignoring response for unknown/completed transaction: " + message.id);
                     }
-                } else if (method) {
-                    // Notification
-                    debug("received notification: " + method + "() from " + origin);
-                    if (regTbl[method]) {
-                        try {
-                            // Notifications have no transaction object, just pass origin and params
-                            regTbl[method]({ origin: origin }, m.params);
-                        } catch (e) {
-                            debug("Exception executing notification handler '" + method + "': " + e);
-                            // Cannot send error back for notification
-                        }
-                    } else {
-                        debug("No handler registered for notification: " + method);
-                    }
-                } else {
-                    debug("Received message that is not a request, response, or notification: " + JSON.stringify(m));
                 }
+                else if (currentMethodName) { // Notification
+                    if (regTbl[currentMethodName]) {
+                        try {
+                            regTbl[currentMethodName]({ origin: origin, id: message.id }, message.params);
+                        } catch (e) {
+                            debug("Exception executing notification handler '" + currentMethodName + "': " + e);
+                        }
+                    } else {
+                        debug("No handler in regTbl for notification method: " + currentMethodName + " (original: " + message.method + ")");
+                    }
+                } else { /* ... */ }
             };
 
-            // Register this channel instance in the global routing table
             s_addBoundChan(cfg.window, cfg.origin, scope, onMessage);
 
-            // Method scoping helper
             var scopeMethod = function (m) {
-                if (scope && scope.length) {
-                    // Ensure method name doesn't already have a scope conflict? No, allow it.
-                    return scope + "::" + m;
-                }
+                if (m === '__ready') return m;
+                if (scope && scope.length) return scope + "::" + m;
                 return m;
             };
 
             // Post message wrapper
             var postMessage = function (msg, force) {
                 if (!msg) throw "postMessage called with null message";
-
                 var msgString = JSON.stringify(msg); // Stringify once
 
                 var verb = (ready ? "post  " : "queue ");
@@ -524,28 +412,17 @@
             };
 
             // Ready state handler
-            var onReady = function (trans, type) {
-                alert("onReady");
-                debug('Received __ready message type: ' + type);
+            var onReady = function (notification_data, params) {
+                var type = params;
                 if (ready) {
-                    debug("Warning: received ready message while already in ready state.");
                     // If it's a ping, we can just pong back maybe?
                     if (type === 'ping') {
                         obj.notify({ method: '__ready', params: 'pong' });
                     }
-                    return; // Don't re-initialize
+                    return;
                 }
-
-                // Assign Left/Right role based on first message received.
-                // This helps debugging but isn't essential for function.
-                if (type === 'ping') {
-                    chanId += '-R'; // Received Ping first, we are Right/Responder
-                } else { // type === 'pong'
-                    chanId += '-L'; // Received Pong first, we are Left/Initiator
-                }
+                if (type === 'ping') chanId += '-R'; else chanId += '-L';
                 debug('Channel determined role: ' + chanId);
-
-                obj.unbind('__ready'); // Unbind the ready handler itself
                 ready = true;
                 debug('Channel ready.');
 
@@ -556,28 +433,19 @@
 
                 // Flush the pending queue
                 debug("Flushing " + pendingQueue.length + " queued messages.");
-                while (pendingQueue.length > 0) {
-                    // Dequeue from front, post immediately (force=true)
-                    postMessage(pendingQueue.shift(), true);
-                }
-
-                // Invoke the external onReady callback
+                while (pendingQueue.length > 0) postMessage(pendingQueue.shift(), true);
                 if (typeof cfg.onReady === 'function') {
-                    try {
-                        cfg.onReady(obj); // Pass the channel object itself
-                    } catch (e) {
-                        debug("Exception in onReady callback: " + e);
-                    }
+                    try { cfg.onReady(obj); } catch (e) { debug("Exception in onReady callback: " + e); }
                 }
             };
 
             // Public channel object
             var obj = {
                 unbind: function (method) {
-                    var scopedMethod = scopeMethod(method);
-                    if (regTbl[scopedMethod]) {
-                        delete regTbl[scopedMethod];
-                        debug("Unbound method: " + scopedMethod);
+                    var methodKey = method; // Use the raw (base) method name
+                    if (regTbl[methodKey]) {
+                        delete regTbl[methodKey];
+                        debug("Unbound method: '" + methodKey + "' (from instance scope: '" + scope + "')");
                         return true;
                     }
                     return false;
@@ -586,38 +454,42 @@
                     if (!method || typeof method !== 'string') throw "'method' argument to bind must be string";
                     if (!cb || typeof cb !== 'function') throw "callback missing from bind params";
 
-                    var scopedMethod = scopeMethod(method);
-                    if (regTbl[scopedMethod]) throw "Method '" + scopedMethod + "' is already bound!";
-                    regTbl[scopedMethod] = cb;
-                    debug("Bound method: " + scopedMethod);
+                    var methodKey = method; // Use the raw (base) method name as the key for regTbl
+
+                    if (regTbl[methodKey]) {
+                        // It's good to also check against the fully qualified scoped name if you want to be super strict
+                        // to prevent binding 'foo' in scope 'A' if 'A::foo' effectively means the same method slot.
+                        // However, for simplicity and directness with how s_onMessage dispatches, using methodKey is the primary fix.
+                        throw "Method '" + methodKey + "' is already bound for this channel instance (scope: '" + scope + "')!";
+                    }
+                    regTbl[methodKey] = cb;
+                    // The debug log can still show how it will be called externally
+                    debug("Bound method: '" + methodKey + "' (instance scope: '" + scope + "', full name: '" + scopeMethod(method) + "')");
                     return this; // Allow chaining
                 },
-                call: function (m) {
-                    if (!m) throw 'missing arguments to call function';
-                    if (!m.method || typeof m.method !== 'string') throw "'method' argument to call must be string";
-                    if (!m.success || typeof m.success !== 'function') throw "'success' callback missing from call";
-                    // m.error is optional, but should be a function if provided
-                    if (m.error && typeof m.error !== 'function') throw "'error' callback must be a function if provided";
+                call: function (m_arg) { // Changed parameter name to m_arg for clarity
+                    debug("[WebView obj.call DEBUG '" + chanId + "'] ENTERED. Received 'm_arg':" + JSON.stringify(m_arg, function(key, value) { if (typeof value === 'function') { return 'function';} return value; }));
 
-
+                    if (!m_arg) throw 'missing arguments to call function';
+                    
+                    if (!m_arg.method || typeof m_arg.method !== 'string') {
+                        throw "'method' argument to call must be string";
+                    }
+                    if (!m_arg.success || typeof m_arg.success !== 'function') throw "'success' callback missing from call";
+                    if (m_arg.error && typeof m_arg.error !== 'function') throw "'error' callback must be a function if provided";
                     var callbacks = {};
                     var callbackNames = [];
-                    var seen = []; // For recursion detection
-
-                    // Recursively find functions in params and replace them with placeholders
+                    var seen = [];
                     var pruneFunctions = function (path, currentParam) {
-                        if (currentParam === null || typeof currentParam !== 'object') return; // Only traverse objects/arrays
-
+                        if (currentParam === null || typeof currentParam !== 'object') return;
                         if (seen.indexOf(currentParam) >= 0) {
                             throw "params cannot be a recursive data structure containing functions";
                         }
                         seen.push(currentParam);
-
                         for (var k in currentParam) {
                             if (!currentParam.hasOwnProperty(k)) continue;
                             var child = currentParam[k];
-                            var np = path + (path.length ? '/' : '') + k; // Build path string
-
+                            var np = path + (path.length ? '/' : '') + k;
                             if (typeof child === 'function') {
                                 callbacks[np] = child; // Store the function
                                 callbackNames.push(np); // Store the path
@@ -631,40 +503,42 @@
                         // Remove from seen list after processing children
                         seen.pop();
                     };
-
+                    var paramsClone = m_arg.params ? JSON.parse(JSON.stringify(m_arg.params)) : undefined;
+                    if (m_arg.params) { // Ensure this uses m_arg.params
+                        pruneFunctions("", m_arg.params);
+                    }
+                    // ***************************************************************************
 
                     // Clone params to avoid modifying the caller's object, then prune.
                     // Deep clone is safer but complex; shallow might suffice if functions aren't nested deeply.
                     // Using JSON parse/stringify for a simple deep clone (loses functions, Dates, etc. - but we handle functions separately)
-                    var paramsClone = m.params ? JSON.parse(JSON.stringify(m.params)) : undefined;
+                    var paramsClone = m_arg.params ? JSON.parse(JSON.stringify(m_arg.params)) : undefined;
                     // Re-run pruneFunctions on the original m.params just to get the callback names/functions
                     // but don't modify m.params itself.
-                    pruneFunctions("", m.params);
-
-
                     // Build request message
                     var currentId = s_curTranId++;
-                    var scopedMethod = scopeMethod(m.method);
-                    var msg = { id: currentId, method: scopedMethod, params: paramsClone }; // Send the cloned params
-                    if (callbackNames.length) msg.callbacks = callbackNames;
+                    var scopedMethod = scopeMethod(m_arg.method); // Use m_arg.method
 
+                    var msg = { id: currentId, method: scopedMethod, params: paramsClone }; // Now paramsClone should be defined
+
+                    if (callbackNames.length) msg.callbacks = callbackNames;
 
                     // Store transaction details
                     outTbl[currentId] = {
-                        callbacks: callbacks, // The actual functions
-                        error: m.error,       // Error handler
-                        success: m.success,   // Success handler
-                        // Store timeoutId if timeout is set
-                        timeoutId: m.timeout ? setTransactionTimeout(currentId, m.timeout, scopedMethod) : null
+                        callbacks: callbacks,
+                        error: m_arg.error,     // Use m_arg
+                        success: m_arg.success, // Use m_arg
+                        timeoutId: m_arg.timeout ? setTransactionTimeout(currentId, m_arg.timeout, scopedMethod) : null // Use m_arg
                     };
 
-                    // Map transaction ID to the internal message handler
-                    s_transIds[currentId] = onMessage;
+                    s_transIds[currentId] = onMessage; // The instance's onMessage
 
-
-                    debug("calling method '" + scopedMethod + "' with id " + currentId);
-                    // Post the message. Use 'force' in RNWebView context as ready state might be ambiguous.
-                    postMessage(msg, isReactNativeWebView);
+                    debug("calling method '" + scopedMethod + "' with id " + currentId + ". Message being sent: " + JSON.stringify(msg).substring(0,100));
+                    // For calls from WebView to RN, ready state is less critical for the initial post,
+                    // as RN side will queue if its channel isn't ready.
+                    // The 'isReactNativeWebView' flag is more relevant here.
+                    postMessage(msg, isReactNativeWebView); // Force post if RNWebView, or rely on 'ready' for browser contexts
+                    return this;
                 },
                 notify: function (m) {
                     if (!m) throw 'missing arguments to notify function';
@@ -712,11 +586,9 @@
             // Initiate the ready handshake immediately after build.
             // Use setTimeout to ensure the current execution context completes.
             // Force post in RNWebView context.
-            debug("Initiating ready handshake (sending ping)");
             window.setTimeout(function () {
-                postMessage({ method: scopeMethod('__ready'), params: "ping" }, isReactNativeWebView);
-            }, 0);
-
+                obj.notify({ method: '__ready', params: "ping" });
+            }, 100);
             return obj;
         } // End of build function
     }; // End of return object

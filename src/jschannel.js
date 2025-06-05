@@ -1,31 +1,58 @@
-// jschannel-react-native.js
-
 /*
- * js_channel (modified for React Native WebView)
- * Lightweight abstraction on top of postMessage for rich interactions.
- * Supports: query/response, query/update/response, notifications, error handling.
- * Based on json-rpc, focused on inter-window/WebView RPC.
+ * js_channel is a very lightweight abstraction on top of
+ * postMessage which defines message formats and semantics
+ * to support interactions more rich than just message passing
+ * js_channel supports:
+ *  + query/response - traditional rpc
+ *  + query/update/response - incremental async return of results
+ *    to a query
+ *  + notifications - fire and forget
+ *  + error handling
  *
- * Modifications for react-native-webview:
- * - Handles window.ReactNativeWebView for posting messages.
- * - Adjusts origin and source handling in s_onMessage.
- * - Modifies postMessage calls to use the correct signature for ReactNativeWebView.
- * - Allows 'react-native-webview' as a valid origin.
- * - Bypasses some checks (like window === cfg.window) when in RN environment.
- * - Adds a 'force' flag to postMessage calls originating from callbacks/ready state changes
- * to potentially bypass 'ready' checks in the RN context.
+ * js_channel is based heavily on json-rpc, but is focused at the
+ * problem of inter-iframe RPC.
+ *
+ * Message types:
+ *  There are 5 types of messages that can flow over this channel,
+ *  and you may determine what type of message an object is by
+ *  examining its parameters:
+ *  1. Requests
+ *    + integer id
+ *    + string method
+ *    + (optional) any params
+ *  2. Callback Invocations (or just "Callbacks")
+ *    + integer id
+ *    + string callback
+ *    + (optional) params
+ *  3. Error Responses (or just "Errors)
+ *    + integer id
+ *    + string error
+ *    + (optional) string message
+ *  4. Responses
+ *    + integer id
+ *    + (optional) any result
+ *  5. Notifications
+ *    + string method
+ *    + (optional) any params
  */
 
-; var Channel = (function () {
+;var Channel = (function() {
     "use strict";
 
-    // current transaction id
-    var s_curTranId = Math.floor(Math.random() * 1000001);
+    // current transaction id, start out at a random *odd* number between 1 and a million
+    // There is one current transaction counter id per page, and it's shared between
+    // channel instances.  That means of all messages posted from a single javascript
+    // evaluation context, we'll never have two with the same id.
+    var s_curTranId = Math.floor(Math.random()*1000001);
 
-    // bound channels table
-    var s_boundChans = {};
-
-    // add a channel to s_boundChans
+    // no two bound channels in the same javascript evaluation context may have the same origin, scope, and window.
+    // futher if two bound channels have the same window and scope, they may not have *overlapping* origins
+    // (either one or both support '*').  This restriction allows a single onMessage handler to efficiently
+    // route messages based on origin and scope.  The s_boundChans maps origins to scopes, to message
+    // handlers.  Request and Notification messages are routed using this table.
+    // Finally, channels are inserted into this table when built, and removed when destroyed.
+    var s_boundChans = { };
+    // add a channel to s_boundChans, throwing if a dup exists
     function s_addBoundChan(win, origin, scope, handler) {
         function hasWin(arr) {
             // In RN WebView, 'win' might be the ReactNativeWebView object, not a WindowProxy
@@ -33,9 +60,11 @@
             return false;
         }
 
+        // does she exist?
         var exists = false;
 
         if (origin === '*') {
+            // we must check all other origins, sadly.
             for (var k in s_boundChans) {
                 if (!s_boundChans.hasOwnProperty(k)) continue;
                 if (k === '*') continue;
@@ -45,21 +74,21 @@
                 }
             }
         } else {
-            // Check '*' first
-            if (s_boundChans['*'] && s_boundChans['*'][scope]) {
+            // we must check only '*'
+            if ((s_boundChans['*'] && s_boundChans['*'][scope])) {
                 exists = hasWin(s_boundChans['*'][scope]);
             }
             // Check specific origin if '*' didn't match or doesn't exist
-            if (!exists && s_boundChans[origin] && s_boundChans[origin][scope]) {
+            if (!exists && s_boundChans[origin] && s_boundChans[origin][scope])
+            {
                 exists = hasWin(s_boundChans[origin][scope]);
             }
         }
-
         if (exists) throw "A channel is already bound to the same window/interface which overlaps with origin '" + origin + "' and has scope '" + scope + "'";
-
-        if (typeof s_boundChans[origin] != 'object') s_boundChans[origin] = {};
-        if (typeof s_boundChans[origin][scope] != 'object') s_boundChans[origin][scope] = [];
-        s_boundChans[origin][scope].push({ win: win, handler: handler });
+        
+        if (typeof s_boundChans[origin] != 'object') s_boundChans[origin] = { };
+        if (typeof s_boundChans[origin][scope] != 'object') s_boundChans[origin][scope] = [ ];
+        s_boundChans[origin][scope].push({win: win, handler: handler});
     }
 
     // remove a channel from s_boundChans
@@ -68,7 +97,7 @@
             var arr = s_boundChans[origin][scope];
             for (var i = 0; i < arr.length; i++) {
                 if (arr[i].win === win) {
-                    arr.splice(i, 1);
+                    arr.splice(i,1);
                     break; // Assume only one instance per win/origin/scope
                 }
             }
@@ -90,23 +119,35 @@
         }
     }
 
-    // outstanding transaction table
-    var s_transIds = {};
+    // No two outstanding outbound messages may have the same id, period.  Given that, a single table
+    // mapping "transaction ids" to message handlers, allows efficient routing of Callback, Error, and
+    // Response messages.  Entries are added to this table when requests are sent, and removed when
+    // responses are received.
+    var s_transIds = { };
 
-    // global message handler
-    var s_onMessage = function (e) {
+    // class singleton onMessage handler
+    // this function is registered once and all incoming messages route through here.  This
+    // arrangement allows certain efficiencies, message data is only parsed once and dispatch
+    // is more efficient, especially for large numbers of simultaneous channels.
+    var s_onMessage = function(e) {
         var m;
         try {
             m = JSON.parse(e.data);
             if (typeof m !== 'object' || m === null) throw "malformed";
-        } catch (err) {
-            // Ignore non-JSON messages
+        } catch(e) {
+            // just ignore any posted messages that do not consist of valid JSON
             return;
         }
-
-        var w, o, s, i, meth;
-
-        // Adapt for react-native-webview environment
+        
+        var w, o, s = '', i, meth; // Initialize scope s to empty string by default
+        // UNIVERSAL: Adapt for react-native-webview environment for w (source) and o (origin)
+        var isReactNativeEvent = typeof e.origin === 'undefined' && window.ReactNativeWebView && e.source === null; // Heuristic for events dispatched internally after RN message
+                                                                                                    // Or if message comes directly from RN, e.source might be current window or null.
+                                                                                                    // A better way would be for RN to inject a specific property into 'e' or 'm'
+                                                                                                    // For now, we rely on isReactNativeWebView global check within build context.
+                                                                                                    // The source 'w' is tricky here if the message is from RN to webview.
+                                                                                                    // `Channel.build` sets `cfg.window` correctly.
+                                                                                                    // `s_boundChans` uses that `cfg.window` for comparison.
         if (window.ReactNativeWebView) {
             o = '*'; // Origin isn't typically provided or meaningful in RNWebView postMessage
             w = window.ReactNativeWebView; // The interface object acts as the 'window'
@@ -114,23 +155,40 @@
             o = e.origin;
             w = e.source;
         }
-        // Extract scope and method
+
         if (typeof m.method === 'string') {
             var ar = m.method.split('::');
-            if (ar.length == 2) { s = ar[0]; meth = ar[1]; }
-            else { s = ''; meth = m.method; }
+            if (ar.length == 2) {
+                s = ar[0];
+                meth = ar[1];
+            } else {
+                meth = m.method;
+            }
         }
+
         if (typeof m.id !== 'undefined') i = m.id;
 
-        // Route message based on properties
+        // w is message source window
+        // o is message origin
+        // m is parsed message
+        // s is message scope
+        // i is message id (or undefined)
+        // meth is unscoped method name
+        // ^^ based on these factors we can route the message
+
+        // if it has a method it's either a notification or a request,
+        // route using s_boundChans
         if (typeof meth === 'string') {
             // Request or Notification
             var delivered = false;
             // Check specific origin first (standard behavior)
             if (s_boundChans[o] && s_boundChans[o][s]) {
                 for (var j = 0; j < s_boundChans[o][s].length; j++) {
+                    // For RN, s_boundChans[...].win is ReactNativeWebView, w should match this.
+                    // For iframe, s_boundChans[...].win is contentWindow, w should be e.source.
                     if (s_boundChans[o][s][j].win === w) {
                         s_boundChans[o][s][j].handler(o, meth, m);
+
                         delivered = true;
                         break;
                     }
@@ -146,140 +204,188 @@
                     }
                 }
             }
-            // if (!delivered) {
-            //     console.debug("jschannel: dropped message, no handler for", o, s, meth, w);
-            // }
-        } else if (typeof i !== 'undefined') {
-            // Response, Error, or Callback Invocation
-            if (s_transIds[i]) {
-                // Pass origin (o), method (meth will be undefined here), and message (m)
-                s_transIds[i](o, meth, m);
-            }
-            // else {
-            //    console.debug("jschannel: dropped message, unknown transaction id:", i);
-            // }
         }
-        // else {
-        //    console.debug("jschannel: dropped message, missing method and id:", m);
-        // }
+        // otherwise it must have an id (or be poorly formed
+        else if (typeof i != 'undefined') {
+            if (s_transIds[i]) s_transIds[i](o, meth, m);
+        }
     };
 
     // Setup postMessage event listeners
     if (window.addEventListener) window.addEventListener('message', s_onMessage, false);
     else if (window.attachEvent) window.attachEvent('onmessage', s_onMessage);
 
-    // Channel builder
+    /* a messaging channel is constructed from a window and an origin.
+     * the channel will assert that all messages received over the
+     * channel match the origin
+     *
+     * Arguments to Channel.build(cfg):
+     *
+     *   cfg.window - the remote window with which we'll communicate
+     *   cfg.origin - the expected origin of the remote window, may be '*'
+     *                which matches any origin
+     *   cfg.scope  - the 'scope' of messages.  a scope string that is
+     *                prepended to message names.  local and remote endpoints
+     *                of a single channel must agree upon scope. Scope may
+     *                not contain double colons ('::').
+     *   cfg.debugOutput - A boolean value.  If true and window.console.log is
+     *                a function, then debug strings will be emitted to that
+     *                function.
+     *   cfg.debugOutput - A boolean value.  If true and window.console.log is
+     *                a function, then debug strings will be emitted to that
+     *                function.
+     *   cfg.postMessageObserver - A function that will be passed two arguments,
+     *                an origin and a message.  It will be passed these immediately
+     *                before messages are posted.
+     *   cfg.gotMessageObserver - A function that will be passed two arguments,
+     *                an origin and a message.  It will be passed these arguments
+     *                immediately after they pass scope and origin checks, but before
+     *                they are processed.
+     *   cfg.onReady - A function that will be invoked when a channel becomes "ready",
+     *                this occurs once both sides of the channel have been
+     *                instantiated and an application level handshake is exchanged.
+     *                the onReady function will be passed a single argument which is
+     *                the channel object that was returned from build().
+     */
     return {
-        build: function (cfg) {
+        build: function(cfg) {
+            /* private variables */
+            // generate a random and psuedo unique id for this channel
             var chanId = (function () {
                 var text = "";
                 var alpha = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-                for (var i = 0; i < 5; i++) text += alpha.charAt(Math.floor(Math.random() * alpha.length));
+                for(var i=0; i < 5; i++) text += alpha.charAt(Math.floor(Math.random() * alpha.length));
                 return text;
             })();
 
-            var debug = function (m) {
+            var debug = function(m) {
                 if (cfg.debugOutput && window.console && window.console.log) {
-                    try { if (typeof m !== 'string') m = JSON.stringify(m); } catch (e) { /* ignore */ }
+                    // try to stringify, if it doesn't work we'll let javascript's built in toString do its magic
+                    try { if (typeof m !== 'string') m = JSON.stringify(m); } catch(e) { }
+                    console.log("["+chanId+"] " + m);
                 }
             };
 
-            /* Capability checks */
-            // window.postMessage is not the primary mechanism in RNWebView, ReactNativeWebView.postMessage is.
-            // Allow build to proceed if ReactNativeWebView is present.
-            var hasPostMessage = !!(window.postMessage || window.ReactNativeWebView);
-            if (!hasPostMessage) throw ("jschannel cannot run this environment, no postMessage or ReactNativeWebView found");
-            if (!window.JSON || !window.JSON.stringify || !window.JSON.parse) {
-                throw ("jschannel cannot run this browser, no JSON support");
+            var isReactNativeWebView = !!window.ReactNativeWebView;
+            
+            /* browser capabilities check */
+            if (isReactNativeWebView) {
+                // React Native WebView environment
+                if (!window.ReactNativeWebView.postMessage || typeof window.ReactNativeWebView.postMessage !== 'function') {
+                    throw ("ReactNativeWebView.postMessage is not a function");
+                }
+            } else {
+                // Standard iframe environment
+                if (!window.postMessage) throw("jschannel cannot run this browser, no postMessage");
+            }
+            
+            if (!window.JSON || !window.JSON.stringify || ! window.JSON.parse) {
+                throw("jschannel cannot run this browser, no JSON parsing/serialization");
             }
 
             /* Basic argument validation */
             if (typeof cfg !== 'object' || cfg === null) throw ("Channel build invoked without a config object");
 
-            var isReactNativeWebView = !!window.ReactNativeWebView;
-
             if (isReactNativeWebView) {
-                // In RNWebView, the 'window' is the ReactNativeWebView object itself
-                if (!window.ReactNativeWebView.postMessage || typeof window.ReactNativeWebView.postMessage !== 'function') {
-                    throw ("ReactNativeWebView.postMessage is not a function");
-                }
+                // React Native WebView environment
                 cfg.window = window.ReactNativeWebView;
-                // Default origin for RN WebView if not specified, '*' is safer than a specific string
-                if (typeof cfg.origin === 'undefined') cfg.origin = '*';
+                cfg.origin = (typeof cfg.origin === 'string') ? cfg.origin : '*'; // Default to '*' for RN if not specified
+                // No window === cfg.window check for RN
             } else {
-                // Standard browser environment
-                if (!cfg.window || typeof cfg.window.postMessage !== 'function') {
-                    throw ("Channel.build() called without a valid window argument");
+                // Standard iframe environment
+                if (!cfg.window || !cfg.window.postMessage) throw("Channel.build() called without a valid window argument");
+
+                /* we'd have to do a little more work to be able to run multiple channels that intercommunicate the same
+                 * window...  Not sure if we care to support that */
+                if (window === cfg.window) throw("target window is same as present window -- not allowed");
+
+                // let's require that the client specify an origin.  if we just assume '*' we'll be
+                // propagating unsafe practices.  that would be lame.
+                var validOrigin = false;
+                if (typeof cfg.origin === 'string') {
+                    var oMatch;
+                    if (cfg.origin === "*") validOrigin = true;
+                    // allow valid domains under http and https.  Also, trim paths off otherwise valid origins.
+                    else if (null !== (oMatch = cfg.origin.match(/^https?:\/\/(?:[-a-zA-Z0-9_\.])+(?::\d+)?/))) {
+                        cfg.origin = oMatch[0].toLowerCase();
+                        validOrigin = true;
+                    }
                 }
-                if (window === cfg.window) throw ("Target window is same as present window -- not allowed");
-                // Require explicit origin in standard env
-                if (typeof cfg.origin !== 'string') throw ("Channel.build() requires an origin argument"); 
+
+                if (!validOrigin) throw ("Channel.build() called with an invalid origin");
             }
 
-            // Validate scope
-            var scope = ''; // Default scope is empty string
             if (typeof cfg.scope !== 'undefined') {
                 if (typeof cfg.scope !== 'string') throw 'scope, when specified, must be a string';
                 if (cfg.scope.split('::').length > 1) throw "scope may not contain double colons: '::'";
-                scope = cfg.scope; // Use provided scope
             }
-            debug("Final scope for this instance: '" + scope + "'");
 
-            var regTbl = {}; var outTbl = {}; var inTbl = {};
-            var ready = false; var pendingQueue = [];
+            // registrations: mapping method names to call objects
+            var regTbl = { };
+            // current oustanding sent requests
+            var outTbl = { };
+            // current oustanding received requests
+            var inTbl = { };
+            // are we ready yet?  when false we will block outbound messages.
+            var ready = false;
+            var pendingQueue = [ ];
 
-            // Transaction creation logic
             var createTransaction = function (id, origin, callbacks) {
                 var shouldDelayReturn = false;
                 var completed = false;
-                var localDebug = function (m) { debug("transaction(" + id + "): " + m); };
 
                 return {
                     origin: origin,
-                    invoke: function (cbName, v) {
-                        if (completed) { localDebug("Warning: invoke called after completion"); return; }
-                        if (!inTbl[id]) { localDebug("Warning: invoke called for nonexistent transaction"); return; }
+                    invoke: function(cbName, v) {
+                        // verify in table
+                        if (!inTbl[id]) throw "attempting to invoke a callback of a nonexistent transaction: " + id;
+                        // verify that the callback name is valid
                         var valid = false;
                         for (var i = 0; i < callbacks.length; i++) if (cbName === callbacks[i]) { valid = true; break; }
-                        if (!valid) throw "Request supports no such callback '" + cbName + "'";
-                        postMessage({ id: id, callback: cbName, params: v }, isReactNativeWebView);
+                        if (!valid) throw "request supports no such callback '" + cbName + "'";
+
+                        // send callback invocation
+                        postMessage({ id: id, callback: cbName, params: v }, isReactNativeWebView); // Force post in RN
                     },
-                    error: function (error, message) {
-                        if (completed) { localDebug("Warning: error called after completion"); return; }
+                    error: function(error, message) {
                         completed = true;
-                        if (!inTbl[id]) { localDebug("Warning: error called for nonexistent transaction"); return; }
+                        // verify in table
+                        if (!inTbl[id]) throw "error called for nonexistent message: " + id;
+
+                        // remove transaction from table
                         delete inTbl[id];
-                        postMessage({ id: id, error: error, message: message }, isReactNativeWebView);
+
+                        // send error
+                        postMessage({ id: id, error: error, message: message }, isReactNativeWebView); // Force post in RN
                     },
-                    complete: function (v) {
-                        if (completed) { localDebug("Warning: complete called after completion"); return; }
+                    complete: function(v) {
                         completed = true;
-                        if (!inTbl[id]) { localDebug("Warning: complete called for nonexistent transaction"); return; }
+                        // verify in table
+                        if (!inTbl[id]) throw "complete called for nonexistent message: " + id;
+                        // remove transaction from table
                         delete inTbl[id];
-                        // Don't delete from s_transIds here
+                        // send complete
                         postMessage({ id: id, result: v }, isReactNativeWebView); // Force post in RN
                     },
-                    delayReturn: function (delay) {
-                        if (typeof delay === 'boolean') { shouldDelayReturn = (delay === true); }
+                    delayReturn: function(delay) {
+                        if (typeof delay === 'boolean') {
+                            shouldDelayReturn = (delay === true);
+                        }
                         return shouldDelayReturn;
                     },
-                    completed: function () {
+                    completed: function() {
                         return completed;
                     }
                 };
             };
 
-            // Timeout handler for outbound requests
-            var setTransactionTimeout = function (transId, timeout, method) {
-                return window.setTimeout(function () {
+            var setTransactionTimeout = function(transId, timeout, method) {
+                return window.setTimeout(function() {
                     if (outTbl[transId]) {
+                        // XXX: what if client code raises an exception here?
                         var msg = "timeout (" + timeout + "ms) exceeded on method '" + method + "'";
-                        debug(msg + " for transaction " + transId);
                         try {
-                            // Ensure error callback exists before calling
-                            if (typeof outTbl[transId].error === 'function') {
-                                outTbl[transId].error("timeout_error", msg);
-                            }
+                            (1,outTbl[transId].error)("timeout_error", msg);
                         } catch (e) {
                             debug("Exception executing timeout handler: " + e);
                         } finally {
@@ -291,111 +397,147 @@
                 }, timeout);
             };
 
-            // Internal message handler for routing based on cfg
-            var onMessage = function (origin, methodFromHandler, message) {
-                if (typeof cfg.gotMessageObserver === 'function') { /* ... */ }
-                var currentMethodName = methodFromHandler;
+            var onMessage = function(origin, method, m) {
+                // if an observer was specified at allocation time, invoke it
+                if (typeof cfg.gotMessageObserver === 'function') {
+                    // pass observer a clone of the object so that our
+                    // manipulations are not visible (i.e. method unscoping).
+                    // This is not particularly efficient, but then we expect
+                    // that message observers are primarily for debugging anyway.
+                    try {
+                        cfg.gotMessageObserver(origin, m);
+                    } catch (e) {
+                        debug("gotMessageObserver() raised an exception: " + e.toString());
+                    }
+                }
 
-                if (message.id && currentMethodName) { // Request
-                    if (regTbl[currentMethodName]) {
-                        var trans = createTransaction(message.id, origin, message.callbacks ? message.callbacks : []);
-                        inTbl[message.id] = { callbacks: message.callbacks };
+                // now, what type of message is this?
+                if (m.id && method) {
+                    // a request!  do we have a registered handler for this request?
+                    if (regTbl[method]) {
+                        var trans = createTransaction(m.id, origin, m.callbacks ? m.callbacks : [ ]);
+                        inTbl[m.id] = { };
                         try {
-                            var resp = regTbl[currentMethodName](trans, message.params); // This calls the user's bound function
-                            // If the bound function (e.g. messageFromRN) calls trans.complete(),
-                            // then trans.completed() will be true here.
-                            if (!trans.delayReturn() && !trans.completed()) {
-                                trans.complete(resp);
-                            } else {
-                                debug("Bound method '" + currentMethodName + "' already completed or delayed return. Trans state: " + trans.completed());
-                            }
-                        } catch (e) {
-                            // This is where the "ReferenceError: Can't find variable: completed" was caught
-                            if (trans && !trans.completed()) { // Ensure trans exists and not already completed
-                                trans.error("runtime_error", e.toString());
-                            }
-                        }
-                    } else {
-                        debug("No handler in regTbl for request method: " + currentMethodName + " (original: " + message.method + ")");
-                    }
-                } else if (message.id && message.callback) {
-                    debug("received callback: " + message.callback + " for transaction " + message.id);
-                    if (outTbl[message.id] && outTbl[message.id].callbacks && outTbl[message.id].callbacks[message.callback]) {
-                        try {
-                            outTbl[message.id].callbacks[message.callback](message.params);
-                        } catch (e) {
-                            debug("Exception executing callback function for '" + message.callback + "': " + e);
-                        }
-                    } else {
-                        debug("ignoring invalid callback invocation, id: " + message.id + ", callback: " + message.callback);
-                    }
-                }
-                else if (message.id) {
-                    debug("received response/error for transaction " + message.id); // Use 'message.id'
-                    if (outTbl[message.id]) { // Use 'message.id'
-                        // Clear any timeout
-                        if (outTbl[message.id].timeoutId) {
-                            window.clearTimeout(outTbl[message.id].timeoutId);
-                        }
-                        try {
-                            if (message.error) { // Use 'message.error'
-                                if (typeof outTbl[message.id].error === 'function') {
-                                    outTbl[message.id].error(message.error, message.message); // Use 'message.error' and 'message.message'
-                                } else {
-                                    debug("No error handler for transaction " + message.id + ", error: " + message.error);
-                                }
-                            } else { // Success
-                                if (typeof outTbl[message.id].success === 'function') {
-                                    outTbl[message.id].success(message.result); // Use 'message.result'
-                                } else {
-                                    debug("No success handler for transaction " + message.id);
+                            // callback handling.  we'll magically create functions inside the parameter list for each
+                            // callback
+                            if (m.callbacks && s_isArray(m.callbacks) && m.callbacks.length > 0) {
+                                for (var i = 0; i < m.callbacks.length; i++) {
+                                    var path = m.callbacks[i];
+                                    var obj = m.params;
+                                    var pathItems = path.split('/');
+                                    for (var j = 0; j < pathItems.length - 1; j++) {
+                                        var cp = pathItems[j];
+                                        if (typeof obj[cp] !== 'object') obj[cp] = { };
+                                        obj = obj[cp];
+                                    }
+                                    obj[pathItems[pathItems.length - 1]] = (function() {
+                                        var cbName = path;
+                                        return function(params) {
+                                            return trans.invoke(cbName, params);
+                                        };
+                                    })();
                                 }
                             }
-                        } catch (e) {
-                            debug("Exception executing success/error handler for transaction " + message.id + ": " + e);
-                        } finally {
-                            delete outTbl[message.id];
-                            delete s_transIds[message.id]; // s_transIds keys are numbers (transaction IDs), message.id is correct here.
+                            var resp = regTbl[method](trans, m.params);
+                            if (!trans.delayReturn() && !trans.completed()) trans.complete(resp);
+                        } catch(e) {
+                            // automagic handling of exceptions:
+                            var error = "runtime_error";
+                            var message = null;
+                            // * if it's a string then it gets an error code of 'runtime_error' and string is the message
+                            if (typeof e === 'string') {
+                                message = e;
+                            } else if (typeof e === 'object') {
+                                // either an array or an object
+                                // * if it's an array of length two, then  array[0] is the code, array[1] is the error message
+                                if (e && s_isArray(e) && e.length == 2) {
+                                    error = e[0];
+                                    message = e[1];
+                                }
+                                // * if it's an object then we'll look form error and message parameters
+                                else if (typeof e.error === 'string') {
+                                    error = e.error;
+                                    if (!e.message) message = "";
+                                    else if (typeof e.message === 'string') message = e.message;
+                                    else e = e.message; // let the stringify/toString message give us a reasonable verbose error string
+                                }
+                            }
+
+                            // message is *still* null, let's try harder
+                            if (message === null) {
+                                try {
+                                    message = JSON.stringify(e);
+                                    /* On MSIE8, this can result in 'out of memory', which
+                                     * leaves message undefined. */
+                                    if (typeof(message) == 'undefined')
+                                      message = e.toString();
+                                } catch (e2) {
+                                    message = e.toString();
+                                }
+                            }
+
+                            trans.error(error,message);
                         }
+                    }
+                } else if (m.id && m.callback) {
+                    if (!outTbl[m.id] ||!outTbl[m.id].callbacks || !outTbl[m.id].callbacks[m.callback])
+                    {
+                        debug("ignoring invalid callback, id:"+m.id+ " (" + m.callback +")");
                     } else {
-                        debug("ignoring response for unknown/completed transaction: " + message.id);
+                        // XXX: what if client code raises an exception here?
+                        outTbl[m.id].callbacks[m.callback](m.params);
+                    }
+                } else if (m.id) {
+                    if (!outTbl[m.id]) {
+                        debug("ignoring invalid response: " + m.id);
+                    } else {
+                        // XXX: what if client code raises an exception here?
+                        if (m.error) {
+                            (1,outTbl[m.id].error)(m.error, m.message);
+                        } else {
+                            if (m.result !== undefined) (1,outTbl[m.id].success)(m.result);
+                            else (1,outTbl[m.id].success)();
+                        }
+                        delete outTbl[m.id];
+                        delete s_transIds[m.id];
+                    }
+                } else if (method) {
+                    // tis a notification.
+                    if (regTbl[method]) {
+                        // yep, there's a handler for that.
+                        // transaction has only origin for notifications.
+                        regTbl[method]({ origin: origin }, m.params);
+                        // if the client throws, we'll just let it bubble out
+                        // what can we do?  Also, here we'll ignore return values
                     }
                 }
-                else if (currentMethodName) { // Notification
-                    if (regTbl[currentMethodName]) {
-                        try {
-                            regTbl[currentMethodName]({ origin: origin, id: message.id }, message.params);
-                        } catch (e) {
-                            debug("Exception executing notification handler '" + currentMethodName + "': " + e);
-                        }
-                    } else {
-                        debug("No handler in regTbl for notification method: " + currentMethodName + " (original: " + message.method + ")");
-                    }
-                } else { /* ... */ }
             };
 
-            s_addBoundChan(cfg.window, cfg.origin, scope, onMessage);
+            // now register our bound channel for msg routing
+            s_addBoundChan(cfg.window, cfg.origin, ((typeof cfg.scope === 'string') ? cfg.scope : ''), onMessage);
 
-            var scopeMethod = function (m) {
+            // scope method names based on cfg.scope specified when the Channel was instantiated
+            var scopeMethod = function(m) {
                 if (m === '__ready') return m;
-                if (scope && scope.length) return scope + "::" + m;
+                if (typeof cfg.scope === 'string' && cfg.scope.length) m = [cfg.scope, m].join("::");
                 return m;
             };
 
-            // Post message wrapper
-            var postMessage = function (msg, force) {
+            // a small wrapper around postmessage whose primary function is to handle the
+            // case that clients start sending messages before the other end is "ready"
+            var postMessage = function(msg, force) {
                 if (!msg) throw "postMessage called with null message";
                 var msgString = JSON.stringify(msg); // Stringify once
 
+                // delay posting if we're not ready yet.
                 var verb = (ready ? "post  " : "queue ");
-                debug(verb + " message: " + msgString + (force ? " (forced)" : ""));
-
+                debug(verb + " message: " + JSON.stringify(msg));
                 if (!force && !ready) {
-                    pendingQueue.push(msg); // Push the object, not the string
+                    pendingQueue.push(msg);
                 } else {
-                    // Observer hook
                     if (typeof cfg.postMessageObserver === 'function') {
                         try {
+                            // cfg.postMessageObserver(cfg.origin, msg);
                             cfg.postMessageObserver(cfg.origin, JSON.parse(msgString)); // Pass parsed clone
                         } catch (e) {
                             debug("postMessageObserver() raised an exception: " + e.toString());
@@ -404,48 +546,55 @@
 
                     // Post using the correct method for the environment
                     if (isReactNativeWebView) {
+                        // React Native WebView environment
+                        // cfg.window.postMessage(msg);
                         cfg.window.postMessage(msgString);
                     } else {
-                        cfg.window.postMessage(msgString, cfg.origin);
+                        // Standard iframe environment
+                        cfg.window.postMessage(msg, cfg.origin);
                     }
                 }
             };
 
-            // Ready state handler
-            var onReady = function (notification_data, params) {
-                var type = params;
+            var onReady = function(trans, type) {
+                debug('ready msg received');
                 if (ready) {
                     // If it's a ping, we can just pong back maybe?
                     if (type === 'ping') {
                         obj.notify({ method: '__ready', params: 'pong' });
+                    } else {
+                        throw "received ready message while in ready state.  help!";
                     }
-                    return;
                 }
-                if (type === 'ping') chanId += '-R'; else chanId += '-L';
-                debug('Channel determined role: ' + chanId);
-                ready = true;
-                debug('Channel ready.');
 
-                // If we received a 'ping', send back a 'pong'
+                if (type === 'ping') {
+                    chanId += '-R';
+                } else {
+                    chanId += '-L';
+                }
+
+                obj.unbind('__ready'); // now this handler isn't needed any more.
+                ready = true;
+                debug('ready msg accepted.');
+
                 if (type === 'ping') {
                     obj.notify({ method: '__ready', params: 'pong' });
                 }
 
-                // Flush the pending queue
-                debug("Flushing " + pendingQueue.length + " queued messages.");
-                while (pendingQueue.length > 0) postMessage(pendingQueue.shift(), true);
-                if (typeof cfg.onReady === 'function') {
-                    try { cfg.onReady(obj); } catch (e) { debug("Exception in onReady callback: " + e); }
+                // flush queue
+                while (pendingQueue.length) {
+                    postMessage(pendingQueue.pop());
                 }
+
+                // invoke onReady observer if provided
+                if (typeof cfg.onReady === 'function') cfg.onReady(obj);
             };
 
-            // Public channel object
             var obj = {
+                // tries to unbind a bound message handler.  returns false if not possible
                 unbind: function (method) {
-                    var methodKey = method; // Use the raw (base) method name
-                    if (regTbl[methodKey]) {
-                        delete regTbl[methodKey];
-                        debug("Unbound method: '" + methodKey + "' (from instance scope: '" + scope + "')");
+                    if (regTbl[method]) {
+                        if (!(delete regTbl[method])) throw ("can't delete method: " + method);
                         return true;
                     }
                     return false;
@@ -454,116 +603,87 @@
                     if (!method || typeof method !== 'string') throw "'method' argument to bind must be string";
                     if (!cb || typeof cb !== 'function') throw "callback missing from bind params";
 
-                    var methodKey = method; // Use the raw (base) method name as the key for regTbl
-
-                    if (regTbl[methodKey]) {
-                        // It's good to also check against the fully qualified scoped name if you want to be super strict
-                        // to prevent binding 'foo' in scope 'A' if 'A::foo' effectively means the same method slot.
-                        // However, for simplicity and directness with how s_onMessage dispatches, using methodKey is the primary fix.
-                        throw "Method '" + methodKey + "' is already bound for this channel instance (scope: '" + scope + "')!";
-                    }
-                    regTbl[methodKey] = cb;
-                    // The debug log can still show how it will be called externally
-                    debug("Bound method: '" + methodKey + "' (instance scope: '" + scope + "', full name: '" + scopeMethod(method) + "')");
-                    return this; // Allow chaining
+                    if (regTbl[method]) throw "method '"+method+"' is already bound!";
+                    regTbl[method] = cb;
+                    return this;
                 },
-                call: function (m_arg) { // Changed parameter name to m_arg for clarity
-                    debug("[WebView obj.call DEBUG '" + chanId + "'] ENTERED. Received 'm_arg':" + JSON.stringify(m_arg, function(key, value) { if (typeof value === 'function') { return 'function';} return value; }));
+                call: function(m) {
+                    if (!m) throw 'missing arguments to call function';
+                    if (!m.method || typeof m.method !== 'string') throw "'method' argument to call must be string";
+                    if (!m.success || typeof m.success !== 'function') throw "'success' callback missing from call";
 
-                    if (!m_arg) throw 'missing arguments to call function';
-                    
-                    if (!m_arg.method || typeof m_arg.method !== 'string') {
-                        throw "'method' argument to call must be string";
-                    }
-                    if (!m_arg.success || typeof m_arg.success !== 'function') throw "'success' callback missing from call";
-                    if (m_arg.error && typeof m_arg.error !== 'function') throw "'error' callback must be a function if provided";
-                    var callbacks = {};
-                    var callbackNames = [];
-                    var seen = [];
-                    var pruneFunctions = function (path, currentParam) {
-                        if (currentParam === null || typeof currentParam !== 'object') return;
-                        if (seen.indexOf(currentParam) >= 0) {
-                            throw "params cannot be a recursive data structure containing functions";
+                    // now it's time to support the 'callback' feature of jschannel.  We'll traverse the argument
+                    // object and pick out all of the functions that were passed as arguments.
+                    var callbacks = { };
+                    var callbackNames = [ ];
+                    var seen = [ ];
+
+                    var pruneFunctions = function (path, obj) {
+                        if (seen.indexOf(obj) >= 0) {
+                            throw "params cannot be a recursive data structure"
                         }
-                        seen.push(currentParam);
-                        for (var k in currentParam) {
-                            if (!currentParam.hasOwnProperty(k)) continue;
-                            var child = currentParam[k];
-                            var np = path + (path.length ? '/' : '') + k;
-                            if (typeof child === 'function') {
-                                callbacks[np] = child; // Store the function
-                                callbackNames.push(np); // Store the path
-                                // Do NOT delete the function from the original params object
-                                // The remote side might need the structure. We send names separately.
-                                // delete currentParam[k]; // This was the original behavior, potentially problematic.
-                            } else if (typeof child === 'object') {
-                                pruneFunctions(np, child); // Recurse
+                        seen.push(obj);
+                       
+                        if (typeof obj === 'object') {
+                            for (var k in obj) {
+                                if (!obj.hasOwnProperty(k)) continue;
+                                var np = path + (path.length ? '/' : '') + k;
+                                if (typeof obj[k] === 'function') {
+                                    callbacks[np] = obj[k];
+                                    callbackNames.push(np);
+                                    delete obj[k];
+                                } else if (typeof obj[k] === 'object') {
+                                    pruneFunctions(np, obj[k]);
+                                }
                             }
                         }
-                        // Remove from seen list after processing children
-                        seen.pop();
                     };
-                    var paramsClone = m_arg.params ? JSON.parse(JSON.stringify(m_arg.params)) : undefined;
-                    if (m_arg.params) { // Ensure this uses m_arg.params
-                        pruneFunctions("", m_arg.params);
-                    }
-                    // ***************************************************************************
+                    pruneFunctions("", m.params);
 
-                    // Clone params to avoid modifying the caller's object, then prune.
-                    // Deep clone is safer but complex; shallow might suffice if functions aren't nested deeply.
-                    // Using JSON parse/stringify for a simple deep clone (loses functions, Dates, etc. - but we handle functions separately)
-                    var paramsClone = m_arg.params ? JSON.parse(JSON.stringify(m_arg.params)) : undefined;
-                    // Re-run pruneFunctions on the original m.params just to get the callback names/functions
-                    // but don't modify m.params itself.
-                    // Build request message
-                    var currentId = s_curTranId++;
-                    var scopedMethod = scopeMethod(m_arg.method); // Use m_arg.method
-
-                    var msg = { id: currentId, method: scopedMethod, params: paramsClone }; // Now paramsClone should be defined
+                    // build a 'request' message and send it
+                    // var msg = { id: s_curTranId, method: scopeMethod(m.method), params: m.params };
+                    var paramsClone = m.params ? JSON.parse(JSON.stringify(m.params)) : undefined;
+                    var msg = { id: s_curTranId, method: scopeMethod(m.method), params: paramsClone }; // Now paramsClone should be defined
 
                     if (callbackNames.length) msg.callbacks = callbackNames;
 
-                    // Store transaction details
-                    outTbl[currentId] = {
-                        callbacks: callbacks,
-                        error: m_arg.error,     // Use m_arg
-                        success: m_arg.success, // Use m_arg
-                        timeoutId: m_arg.timeout ? setTransactionTimeout(currentId, m_arg.timeout, scopedMethod) : null // Use m_arg
-                    };
+                    if (m.timeout)
+                      // XXX: This function returns a timeout ID, but we don't do anything with it.
+                      // We might want to keep track of it so we can cancel it using clearTimeout()
+                      // when the transaction completes.
+                      setTransactionTimeout(s_curTranId, m.timeout, scopeMethod(m.method));
 
-                    s_transIds[currentId] = onMessage; // The instance's onMessage
+                    // insert into the transaction table
+                    outTbl[s_curTranId] = { callbacks: callbacks, error: m.error, success: m.success };
+                    s_transIds[s_curTranId] = onMessage;
 
-                    debug("calling method '" + scopedMethod + "' with id " + currentId + ". Message being sent: " + JSON.stringify(msg).substring(0,100));
-                    // For calls from WebView to RN, ready state is less critical for the initial post,
-                    // as RN side will queue if its channel isn't ready.
-                    // The 'isReactNativeWebView' flag is more relevant here.
+                    // increment current id
+                    s_curTranId++;
+
                     postMessage(msg, isReactNativeWebView); // Force post if RNWebView, or rely on 'ready' for browser contexts
-                    return this;
                 },
-                notify: function (m) {
+                notify: function(m) {
                     if (!m) throw 'missing arguments to notify function';
                     if (!m.method || typeof m.method !== 'string') throw "'method' argument to notify must be string";
 
-                    var scopedMethod = scopeMethod(m.method);
-                    debug("sending notification: " + scopedMethod);
+                    // no need to go into any transaction table
                     // Clone params to avoid modification issues
                     var paramsClone = m.params ? JSON.parse(JSON.stringify(m.params)) : undefined;
-                    postMessage({ method: scopedMethod, params: paramsClone }, isReactNativeWebView); // Force post in RN
+                    postMessage({ method: scopeMethod(m.method), params: paramsClone }, isReactNativeWebView); // Force post in RN
                 },
                 destroy: function () {
-                    debug("Destroying channel: " + chanId);
-                    s_removeBoundChan(cfg.window, cfg.origin, scope);
+                    s_removeBoundChan(cfg.window, cfg.origin, ((typeof cfg.scope === 'string') ? cfg.scope : ''));
 
                     // Remove global listener only if no other channels depend on it?
                     // Hard to track safely, maybe better to leave the listener.
                     // If this is the *only* channel, could remove:
-                    // if (window.removeEventListener) window.removeEventListener('message', s_onMessage, false);
-                    // else if(window.detachEvent) window.detachEvent('onmessage', s_onMessage);
+                    if (window.removeEventListener) window.removeEventListener('message', s_onMessage, false);
+                    else if(window.detachEvent) window.detachEvent('onmessage', s_onMessage);
 
                     // Clear internal state
                     ready = false;
-                    regTbl = {};
-                    inTbl = {};
+                    regTbl = { };
+                    inTbl = { };
                     // Cancel any pending outbound timeouts and clear handlers
                     for (var id in outTbl) {
                         if (outTbl.hasOwnProperty(id)) {
@@ -573,10 +693,11 @@
                             delete s_transIds[id]; // Remove from global handler map too
                         }
                     }
-                    outTbl = {};
-                    cfg.origin = null; // Prevent further use
-                    pendingQueue = [];
-                    chanId = ""; // Clear ID
+                    outTbl = { };
+                    cfg.origin = null;
+                    pendingQueue = [ ];
+                    debug("channel destroyed");
+                    chanId = "";
                 }
             };
 
@@ -587,12 +708,12 @@
             // Use setTimeout to ensure the current execution context completes.
             // Force post in RNWebView context.
             window.setTimeout(function () {
-                obj.notify({ method: '__ready', params: "ping" });
+                postMessage({ method: scopeMethod('__ready'), params: "ping" }, true);
             }, 100);
             return obj;
-        } // End of build function
-    }; // End of return object
-})(); // End of IIFE
+        }
+    };
+})();
 
 // Add export for environments that support it (like Node.js or bundlers)
 if (typeof module !== 'undefined' && module.exports) {

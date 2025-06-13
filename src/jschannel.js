@@ -98,15 +98,10 @@
             for (var i = 0; i < arr.length; i++) {
                 if (arr[i].win === win) {
                     arr.splice(i,1);
-                    break; // Assume only one instance per win/origin/scope
                 }
             }
             if (arr.length === 0) {
                 delete s_boundChans[origin][scope];
-                // Optional: Clean up origin if empty
-                // if (Object.keys(s_boundChans[origin]).length === 0) {
-                //     delete s_boundChans[origin];
-                // }
             }
         }
     }
@@ -140,14 +135,7 @@
         }
         
         var w, o, s = '', i, meth; // Initialize scope s to empty string by default
-        // UNIVERSAL: Adapt for react-native-webview environment for w (source) and o (origin)
-        var isReactNativeEvent = typeof e.origin === 'undefined' && window.ReactNativeWebView && e.source === null; // Heuristic for events dispatched internally after RN message
-                                                                                                    // Or if message comes directly from RN, e.source might be current window or null.
-                                                                                                    // A better way would be for RN to inject a specific property into 'e' or 'm'
-                                                                                                    // For now, we rely on isReactNativeWebView global check within build context.
-                                                                                                    // The source 'w' is tricky here if the message is from RN to webview.
-                                                                                                    // `Channel.build` sets `cfg.window` correctly.
-                                                                                                    // `s_boundChans` uses that `cfg.window` for comparison.
+        
         if (window.ReactNativeWebView) {
             o = '*'; // Origin isn't typically provided or meaningful in RNWebView postMessage
             w = window.ReactNativeWebView; // The interface object acts as the 'window'
@@ -199,7 +187,6 @@
                 for (var j = 0; j < s_boundChans['*'][s].length; j++) {
                     if (s_boundChans['*'][s][j].win === w) {
                         s_boundChans['*'][s][j].handler(o, meth, m);
-                        delivered = true; // Mark delivered even if via wildcard
                         break;
                     }
                 }
@@ -518,7 +505,7 @@
 
             // scope method names based on cfg.scope specified when the Channel was instantiated
             var scopeMethod = function(m) {
-                if (m === '__ready') return m;
+                // if (m === '__ready') return m;
                 if (typeof cfg.scope === 'string' && cfg.scope.length) m = [cfg.scope, m].join("::");
                 return m;
             };
@@ -527,23 +514,19 @@
             // case that clients start sending messages before the other end is "ready"
             var postMessage = function(msg, force) {
                 if (!msg) throw "postMessage called with null message";
-                var msgString = JSON.stringify(msg); // Stringify once
 
-                // delay posting if we're not ready yet.
-                var verb = (ready ? "post  " : "queue ");
-                debug(verb + " message: " + JSON.stringify(msg));
                 if (!force && !ready) {
                     pendingQueue.push(msg);
                 } else {
                     if (typeof cfg.postMessageObserver === 'function') {
                         try {
-                            // cfg.postMessageObserver(cfg.origin, msg);
-                            cfg.postMessageObserver(cfg.origin, JSON.parse(msgString)); // Pass parsed clone
+                            cfg.postMessageObserver(cfg.origin, msg);
                         } catch (e) {
                             debug("postMessageObserver() raised an exception: " + e.toString());
                         }
                     }
 
+                    var msgString = JSON.stringify(msg); // Stringify once
                     // Post using the correct method for the environment
                     if (isReactNativeWebView) {
                         // React Native WebView environment
@@ -551,7 +534,7 @@
                         cfg.window.postMessage(msgString);
                     } else {
                         // Standard iframe environment
-                        cfg.window.postMessage(msg, cfg.origin);
+                        cfg.window.postMessage(msgString, cfg.origin);
                     }
                 }
             };
@@ -559,12 +542,12 @@
             var onReady = function(trans, type) {
                 debug('ready msg received');
                 if (ready) {
-                    // If it's a ping, we can just pong back maybe?
-                    if (type === 'ping') {
-                        obj.notify({ method: '__ready', params: 'pong' });
-                    } else {
+                    // // If it's a ping, we can just pong back maybe?
+                    // if (type === 'ping') {
+                    //     obj.notify({ method: '__ready', params: 'pong' });
+                    // } else {
                         throw "received ready message while in ready state.  help!";
-                    }
+                    // }
                 }
 
                 if (type === 'ping') {
@@ -632,7 +615,7 @@
                                     callbacks[np] = obj[k];
                                     callbackNames.push(np);
                                     delete obj[k];
-                                } else if (typeof obj[k] === 'object') {
+                                } else if (typeof obj[k] === 'object' && obj[k] !== null) {
                                     pruneFunctions(np, obj[k]);
                                 }
                             }
@@ -641,10 +624,7 @@
                     pruneFunctions("", m.params);
 
                     // build a 'request' message and send it
-                    // var msg = { id: s_curTranId, method: scopeMethod(m.method), params: m.params };
-                    var paramsClone = m.params ? JSON.parse(JSON.stringify(m.params)) : undefined;
-                    var msg = { id: s_curTranId, method: scopeMethod(m.method), params: paramsClone }; // Now paramsClone should be defined
-
+                    var msg = { id: s_curTranId, method: scopeMethod(m.method), params: m.params };
                     if (callbackNames.length) msg.callbacks = callbackNames;
 
                     if (m.timeout)
@@ -667,32 +647,15 @@
                     if (!m.method || typeof m.method !== 'string') throw "'method' argument to notify must be string";
 
                     // no need to go into any transaction table
-                    // Clone params to avoid modification issues
-                    var paramsClone = m.params ? JSON.parse(JSON.stringify(m.params)) : undefined;
-                    postMessage({ method: scopeMethod(m.method), params: paramsClone }, isReactNativeWebView); // Force post in RN
+                    postMessage({ method: scopeMethod(m.method), params: m.params }, isReactNativeWebView); // Force post in RN
                 },
                 destroy: function () {
                     s_removeBoundChan(cfg.window, cfg.origin, ((typeof cfg.scope === 'string') ? cfg.scope : ''));
-
-                    // Remove global listener only if no other channels depend on it?
-                    // Hard to track safely, maybe better to leave the listener.
-                    // If this is the *only* channel, could remove:
-                    if (window.removeEventListener) window.removeEventListener('message', s_onMessage, false);
-                    else if(window.detachEvent) window.detachEvent('onmessage', s_onMessage);
-
-                    // Clear internal state
+                    if (window.removeEventListener) window.removeEventListener('message', onMessage, false);
+                    else if(window.detachEvent) window.detachEvent('onmessage', onMessage);
                     ready = false;
                     regTbl = { };
                     inTbl = { };
-                    // Cancel any pending outbound timeouts and clear handlers
-                    for (var id in outTbl) {
-                        if (outTbl.hasOwnProperty(id)) {
-                            if (outTbl[id].timeoutId) {
-                                window.clearTimeout(outTbl[id].timeoutId);
-                            }
-                            delete s_transIds[id]; // Remove from global handler map too
-                        }
-                    }
                     outTbl = { };
                     cfg.origin = null;
                     pendingQueue = [ ];

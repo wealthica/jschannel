@@ -134,11 +134,12 @@
             return;
         }
         
-        var w, o, s = '', i, meth; // Initialize scope s to empty string by default
+        var w, o, s, i, meth; // Initialize scope s to empty string by default
         
         if (window.ReactNativeWebView) {
             o = '*'; // Origin isn't typically provided or meaningful in RNWebView postMessage
             w = window.ReactNativeWebView; // The interface object acts as the 'window'
+            s = '';
         } else {
             o = e.origin;
             w = e.source;
@@ -672,7 +673,7 @@
             // Force post in RNWebView context.
             window.setTimeout(function () {
                 postMessage({ method: scopeMethod('__ready'), params: "ping" }, true);
-            }, 100);
+            }, 0);
             return obj;
         }
     };

@@ -200,8 +200,16 @@
     };
 
     // Setup postMessage event listeners
-    if (window.addEventListener) window.addEventListener('message', s_onMessage, false);
-    else if (window.attachEvent) window.attachEvent('onmessage', s_onMessage);
+    // if (window.addEventListener) window.addEventListener('message', s_onMessage, false);
+    // else if (window.attachEvent) window.attachEvent('onmessage', s_onMessage);
+    
+    if (window.addEventListener) {
+        window.addEventListener('message', s_onMessage, false);
+        // Add document listener for Android WebView compatibility
+        document.addEventListener('message', s_onMessage, false); 
+    } else if (window.attachEvent) {
+        window.attachEvent('onmessage', s_onMessage);
+    }
 
     /* a messaging channel is constructed from a window and an origin.
      * the channel will assert that all messages received over the
@@ -543,12 +551,10 @@
             var onReady = function(trans, type) {
                 debug('ready msg received');
                 if (ready) {
-                    // // If it's a ping, we can just pong back maybe?
-                    // if (type === 'ping') {
-                    //     obj.notify({ method: '__ready', params: 'pong' });
-                    // } else {
-                        throw "received ready message while in ready state.  help!";
-                    // }
+                    if (type === 'ping') {
+                        obj.notify({ method: '__ready', params: 'pong' });
+                    }
+                    return;
                 }
 
                 if (type === 'ping') {
@@ -557,7 +563,7 @@
                     chanId += '-L';
                 }
 
-                obj.unbind('__ready'); // now this handler isn't needed any more.
+                // obj.unbind('__ready'); // now this handler isn't needed any more.
                 ready = true;
                 debug('ready msg accepted.');
 
@@ -652,8 +658,10 @@
                 },
                 destroy: function () {
                     s_removeBoundChan(cfg.window, cfg.origin, ((typeof cfg.scope === 'string') ? cfg.scope : ''));
-                    if (window.removeEventListener) window.removeEventListener('message', onMessage, false);
-                    else if(window.detachEvent) window.detachEvent('onmessage', onMessage);
+                    if (window.removeEventListener) {
+                        window.removeEventListener('message', onMessage, false);
+                        document.removeEventListener('message', onMessage, false);
+                    } else if(window.detachEvent) window.detachEvent('onmessage', onMessage);
                     ready = false;
                     regTbl = { };
                     inTbl = { };
@@ -673,7 +681,7 @@
             // Force post in RNWebView context.
             window.setTimeout(function () {
                 postMessage({ method: scopeMethod('__ready'), params: "ping" }, true);
-            }, 0);
+            }, 100);
             return obj;
         }
     };

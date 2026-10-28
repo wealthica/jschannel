@@ -665,6 +665,12 @@
                     ready = false;
                     regTbl = { };
                     inTbl = { };
+                    // Outbound requests still waiting for a response are routed through the
+                    // module-level s_transIds table. Drop them too: otherwise each one keeps this
+                    // channel's onMessage, and through cfg.window the other window, alive for good.
+                    for (var transId in outTbl) {
+                        if (outTbl.hasOwnProperty(transId)) delete s_transIds[transId];
+                    }
                     outTbl = { };
                     cfg.origin = null;
                     pendingQueue = [ ];
